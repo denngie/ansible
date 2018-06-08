@@ -117,8 +117,33 @@ options:
       - The C(save) argument instructs the module to save the running-
         config to the startup-config at the conclusion of the module
         running.  If check mode is specified, this argument is ignored.
+      - This option is deprecated as of Ansible 2.7 and will be removed
+        in Ansible 3.1, use C(save_when) instead.
     type: bool
     default: 'no'
+  save_when:
+    description:
+      - When changes are made to the device running-configuration, the
+        changes are not copied to non-volatile storage by default.  Using
+        this argument will change that before.  If the argument is set to
+        I(always), then the running-config will always be copied to the
+        startup-config and the I(modified) flag will always be set to
+        True.  If the argument is set to I(modified), then the running-config
+        will only be copied to the startup-config if it has changed since
+        the last save to startup-config.  If the argument is set to
+        I(never), the running-config will never be copied to the
+        startup-config.  If the argument is set to I(changed), then the running-config
+        will only be copied to the startup-config if the task has made a change.
+    default: never
+    choices: ['always', 'never', 'modified', 'changed']
+    version_added: "2.7"
+  diff_ignore_lines:
+    description:
+      - Use this argument to specify one or more lines that should be
+        ignored during the diff.  This is used for lines in the configuration
+        that are automatically updated by the system.  This argument takes
+        a list of regular expressions or exact line matches.
+    version_added: "2.7"
 """
 
 EXAMPLES = """
@@ -161,6 +186,12 @@ vars:
     parents: tunnel-group 1.1.1.1 ipsec-attributes
     passwords: yes
     provider: "{{ cli }}"
+
+- name: save running to startup when modified
+  ios_config:
+    save_when: modified
+    diff_ignore_lines:
+      - ntp clock .*
 
 """
 
@@ -228,11 +259,26 @@ def run(module, result):
             load_config(module, commands)
         result['changed'] = True
 
-    if module.params['save']:
+    diff_ignore_lines = module.params['diff_ignore_lines']
+
+    if module.params['save_when'] == 'always' or module.params['save']:
         if not module.check_mode:
             run_commands(module, 'write mem')
         result['changed'] = True
+    elif module.params['save_when'] == 'modified':
+        output = run_commands(module, ['show running-config', 'show startup-config'])
 
+        running_config = NetworkConfig(indent=1, contents=output[0], ignore_lines=diff_ignore_lines)
+        startup_config = NetworkConfig(indent=1, contents=output[1], ignore_lines=diff_ignore_lines)
+
+        if running_config.sha1 != startup_config.sha1:
+            if not module.check_mode:
+                run_commands(module, 'write mem')
+            result['changed'] = True
+    elif module.params['save_when'] == 'changed' and result['changed']:
+        if not module.check_mode:
+            run_commands(module, 'write mem')
+        result['changed'] = True
 
 def main():
     """ main entry point for module execution
@@ -254,14 +300,20 @@ def main():
         passwords=dict(type='bool', default=False),
 
         backup=dict(type='bool', default=False),
-        save=dict(type='bool', default=False),
+        save=dict(default=False, type='bool', removed_in_version='3.1'),
+
+        save_when=dict(choices=['always', 'never', 'modified', 'changed'], default='never'),
+        diff_ignore_lines=dict(type='list'),
+
     )
 
     argument_spec.update(asa_argument_spec)
 
     mutually_exclusive = [('lines', 'src'),
                           ('parents', 'src'),
-                          ('defaults', 'passwords')]
+                          ('defaults', 'passwords'),
+                          ('save', 'save_when')]
+
 
     required_if = [('match', 'strict', ['lines']),
                    ('match', 'exact', ['lines']),
@@ -275,8 +327,6 @@ def main():
     result = {'changed': False}
 
     check_args(module)
-
-    config = None
 
     if module.params['backup']:
         result['__backup__'] = get_config(module)
